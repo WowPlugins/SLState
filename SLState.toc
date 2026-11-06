@@ -1,8 +1,8 @@
 ## Interface: 30300
 ## Title: SLState
-## Notes: 向 SteamLike 客户端暴露角色状态（潜行）
+## Notes: 向 SteamLike 客户端暴露角色状态（Lua 内存共享 / 像素点，二选一）
 ## Author: SteamLike
-## Version: 1.1
+## Version: 1.3
 ## SavedVariables: SLStateDB
 
 SLState.lua
