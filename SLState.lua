@@ -53,6 +53,7 @@ if SLStateDB.pixel_y == nil then
 end
 
 local PREFIX = "|cff33ff99[SLState]|r "
+local ADDON_NAME = "SLState"
 
 --- 可暴露的状态定义（顺序即数组槽位 / 像素块顺序，最多 10 个）
 local STATE_DEFS = {
@@ -381,20 +382,17 @@ local function BuildControls(parent, prefix, topAnchor, topX, topY)
     methodLabel:SetPoint("TOPLEFT", enable, "BOTTOMLEFT", 4, -6)
     methodLabel:SetText("暴露方式（二选一）")
 
-    local luaCb = MakeCheck(parent, prefix .. "MethodLua", "Lua 内存共享", function(self)
-        if self:GetChecked() then
-            SLStateDB.method = "lua"
-        end
+    -- 二选一：点击已选中的那一项不会把勾去掉（SyncUIControls 会按配置重新勾上）
+    local luaCb = MakeCheck(parent, prefix .. "MethodLua", "Lua 内存共享", function()
+        SLStateDB.method = "lua"
         SyncUIControls()
         Refresh(true)
     end)
     luaCb:SetPoint("TOPLEFT", methodLabel, "BOTTOMLEFT", -4, -2)
     methodChecks.lua[#methodChecks.lua + 1] = luaCb
 
-    local pixelCb = MakeCheck(parent, prefix .. "MethodPixel", "像素点（截图解码）", function(self)
-        if self:GetChecked() then
-            SLStateDB.method = "pixel"
-        end
+    local pixelCb = MakeCheck(parent, prefix .. "MethodPixel", "像素点（截图解码）", function()
+        SLStateDB.method = "pixel"
         SyncUIControls()
         Refresh(true)
     end)
@@ -456,6 +454,11 @@ local function CreatePanel()
     panel:SetScript("OnDragStop", function(self)
         self:StopMovingOrSizing()
     end)
+    -- 每次打开都按当前配置刷新勾选框，避免界面上显示的方式与实际保存的不一致
+    panel:SetScript("OnShow", function()
+        SyncUIControls()
+        UpdateStatus()
+    end)
     panel:SetBackdrop({
         bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
         edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
@@ -488,6 +491,11 @@ local function CreateOptionsPanel()
     local p = CreateFrame("Frame", "SLStateOptionsPanel", InterfaceOptionsFramePanelContainer or UIParent)
     p.name = "SLState"
     p:Hide()
+    -- 原生选项页每次打开时重新同步，保证显示的方式与存档一致
+    p:SetScript("OnShow", function()
+        SyncUIControls()
+        UpdateStatus()
+    end)
 
     local title = p:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
     title:SetPoint("TOPLEFT", p, "TOPLEFT", 16, -16)
@@ -597,6 +605,7 @@ local function HookChatEvents()
 end
 
 local EVENTS = {
+    "ADDON_LOADED",          -- 存档变量就绪后再校正一次配置与界面
     "PLAYER_ENTERING_WORLD", -- 进世界/重载界面：全量刷新一次
     "PLAYER_REGEN_DISABLED", -- 进入战斗（战斗中）
     "PLAYER_REGEN_ENABLED",  -- 脱离战斗
@@ -612,14 +621,31 @@ local SL_FRAME = CreateFrame("Frame")
 for _, ev in ipairs(EVENTS) do
     SL_FRAME:RegisterEvent(ev)
 end
-SL_FRAME:SetScript("OnEvent", function(_, event, unit)
+SL_FRAME:SetScript("OnEvent", function(_, event, arg1)
+    if event == "ADDON_LOADED" then
+        if arg1 ~= ADDON_NAME then
+            return
+        end
+        -- 插件文件可能先于存档变量执行（不同客户端加载顺序不同），
+        -- 此时 SLStateDB 还是默认值。ADDON_LOADED 触发时 SV 一定已就绪，
+        -- 这里按存档重新校正一次，避免重进游戏后又显示成默认方式。
+        if SLStateDB.method ~= "lua" and SLStateDB.method ~= "pixel" then
+            SLStateDB.method = "lua"
+        end
+        -- 这里只同步界面；像素块留到 PLAYER_ENTERING_WORLD 再画，
+        -- 避免在角色选择界面就冒出色块
+        SyncUIControls()
+        UpdateStatus()
+        Debug("ADDON_LOADED：配置已按存档恢复，方式 = " .. SLStateDB.method)
+        return
+    end
     if event == "PLAYER_ENTERING_WORLD" then
         HookChatEditBox() -- 加载时聊天框可能还没建好，这里补挂一次
         Debug("PLAYER_ENTERING_WORLD 触发，立即刷新")
         Refresh(true)
         return
     end
-    if event == "UNIT_AURA" and unit and unit ~= "player" then
+    if event == "UNIT_AURA" and arg1 and arg1 ~= "player" then
         return -- 只关心玩家自身的光环
     end
     MarkDirty()
