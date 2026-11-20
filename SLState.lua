@@ -98,11 +98,11 @@ SL_STATE_MEM = BUF
 
 local seq = 0
 local lastStates = {}
+local pulsedStates = {} -- BUF 里当前这一帧实际写入的内容（用于关闭时判断是否要清零）
 local acc = 0          -- 瞬时状态轮询计时（只用于下落/游泳）
+local resyncAcc = 0    -- 兜底全量复检计时（每秒一次）
 local dirty = false    -- 是否有待处理的状态事件
 local dirtyAcc = 0     -- 事件合并计时
-local usedFallback = false
-local chatEditHooked = false -- 聊天输入框脚本是否已挂上（加载时可能还不存在，进世界后重试）
 local panel
 local optionsPanel
 local statusTexts = {}
@@ -176,32 +176,61 @@ local function Pulse(states)
     BUF[SLOT_CHECKSUM] = chk
     BUF[SLOT_SEQ] = seq
     BUF[SLOT_SEQ2] = seq
+    pulsedStates = states
     Debug(string.format("写入帧 seq=%d chk=%d", seq, chk))
     UpdateStatus()
 end
 
+--- 潜行类增益的图标关键字
+--- ability_stealth：盗贼潜行；ability_ambush：德鲁伊豹形态潜行 / 暗夜精灵影遁；ability_vanish：消失
+local STEALTH_ICONS = { "ability_stealth", "ability_ambush", "ability_vanish" }
+
 --- 检测玩家是否处于潜行状态
---- 优先用 IsStealthed()；个别客户端没有该 API 时退回扫描玩家增益图标
+--- IsStealthed() 与增益图标扫描两条路同时用，任一命中即算潜行：
+--- 有的客户端没有 IsStealthed，有的客户端它刷新不及时，只认其中一条会偶尔漏掉
 local function DetectStealth()
-    if IsStealthed then
-        return IsStealthed() and 1 or 0
+    if IsStealthed and IsStealthed() then
+        return 1
     end
-    if not usedFallback then
-        usedFallback = true
-        Debug("IsStealthed 不可用，改为扫描玩家增益图标")
-    end
-    for i = 1, 16 do
+    -- 不能只扫前 16 个：团队增益多时潜行会排在后面。扫到空槽为止
+    for i = 1, 40 do
         -- 1.12 的第 1 个返回值是图标路径，3.3.5 的第 3 个才是，两者都取
         local first, _, third = UnitBuff("player", i)
+        if not first and not third then
+            break
+        end
         local icon = third or first
         if icon then
             local lower = string.lower(icon)
-            if string.find(lower, "ability_stealth") or string.find(lower, "ability_ambush") then
-                return 1
+            for k = 1, #STEALTH_ICONS do
+                if string.find(lower, STEALTH_ICONS[k], 1, true) then
+                    return 1
+                end
             end
         end
     end
     return 0
+end
+
+--- 取第 i 个聊天窗口的输入框（1.12 / 3.3.5 的全局名都是 ChatFrameNEditBox）
+local function ChatEditBox(i)
+    local eb = _G["ChatFrame" .. i .. "EditBox"]
+    if not eb and i == 1 and ChatFrame1 then
+        eb = ChatFrame1.editBox
+    end
+    return eb
+end
+
+--- 是否有聊天输入框处于打开状态
+--- 每个聊天窗口各有自己的输入框，只看 ChatFrame1 会漏掉在私聊/交易等窗口里打字的情况
+local function IsChatEditOpen()
+    for i = 1, (NUM_CHAT_WINDOWS or 10) do
+        local eb = ChatEditBox(i)
+        if eb and eb:IsShown() then
+            return true
+        end
+    end
+    return false
 end
 
 --- 按状态 id 分发到具体的客户端 API（API 不存在时视为假）
@@ -209,8 +238,8 @@ local function DetectState(id)
     if id == "stealthed" then
         return DetectStealth() == 1
     elseif id == "chatOpen" then
-        -- 聊天输入框打开（正在打字）才算"聊天窗打开"；ChatFrame1 本身常驻显示，不能用来判断
-        return (ChatFrame1EditBox and ChatFrame1EditBox:IsShown()) and true or false
+        -- 聊天输入框打开（正在打字）才算"聊天窗打开"；ChatFrame 本身常驻显示，不能用来判断
+        return IsChatEditOpen()
     elseif id == "inCombat" then
         return UnitAffectingCombat and UnitAffectingCombat("player") and true or false
     elseif id == "mounted" then
@@ -332,14 +361,21 @@ end
 local function Refresh(force)
     if not SLStateDB.enabled then
         HidePixels()
-        UpdateStatus()
+        -- 关闭时补写一帧全 0，否则外部读端会一直停在关闭前的最后一帧（例如一直以为在潜行）
+        if StatesChanged(pulsedStates, {}) then
+            Pulse({})
+        else
+            UpdateStatus()
+        end
         return
     end
     local states = DetectAllStates()
     local changed = force or StatesChanged(lastStates, states)
     lastStates = states
     if SLStateDB.method == "pixel" then
-        DrawPixels(states)
+        if changed then -- 状态没变就不重摆色块，省得每秒重排版
+            DrawPixels(states)
+        end
         UpdateStatus()
     else
         HidePixels()
@@ -550,7 +586,9 @@ CreateOptionsPanel()
 -- 事件驱动
 -- 绝大多数状态都有对应的客户端事件；事件到来时只打脏标记，由 50ms 合并窗口
 -- 统一刷新一次，避免 UNIT_AURA 这类高频事件反复重绘。
--- 只有「下落中 / 游泳中」是瞬时查询、没有事件可用，且仅在用户勾选它们时才轮询。
+-- 「下落中 / 游泳中」是瞬时查询、没有事件可用，且仅在用户勾选它们时才轮询。
+-- 另外每秒做一次全量复检兜底：读蓝条后增益还没同步好、个别事件被插件吞掉时，
+-- 状态能在一秒内自动纠正，不会一直卡在旧值上。
 -- ---------------------------------------------------------------------
 local function MarkDirty()
     dirty = true
@@ -586,14 +624,13 @@ local function SafeHook(name)
 end
 
 local function HookChatEditBox()
-    if chatEditHooked then
-        return
-    end
-    local eb = ChatFrame1EditBox or (ChatFrame1 and ChatFrame1.editBox)
-    if eb and eb.HookScript then
-        eb:HookScript("OnShow", MarkDirty)
-        eb:HookScript("OnHide", MarkDirty)
-        chatEditHooked = true
+    for i = 1, (NUM_CHAT_WINDOWS or 10) do
+        local eb = ChatEditBox(i)
+        if eb and eb.HookScript and not eb.slstateHooked then
+            eb.slstateHooked = true
+            eb:HookScript("OnShow", MarkDirty)
+            eb:HookScript("OnHide", MarkDirty)
+        end
     end
 end
 
@@ -661,11 +698,19 @@ SL_FRAME:SetScript("OnUpdate", function(_, elapsed)
             Refresh()
         end
     end
-    -- 仅当勾选了无事件的瞬时状态（下落/游泳）时才轮询，否则完全零轮询
+    -- 仅当勾选了无事件的瞬时状态（下落/游泳）时才高频轮询
     if SLStateDB.enabled and NeedsPolling() then
         acc = acc + elapsed
         if acc >= 0.1 then
             acc = 0
+            Refresh()
+        end
+    end
+    -- 兜底复检：每秒全量读一次，漏事件或进世界时增益未就绪都能自愈
+    if SLStateDB.enabled then
+        resyncAcc = resyncAcc + elapsed
+        if resyncAcc >= 1 then
+            resyncAcc = 0
             Refresh()
         end
     end
